@@ -21,7 +21,7 @@ ancestor chain's worth of raw blobs as a `fetchall()`-materialized list.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from langgraph.checkpoint.base import (
@@ -60,6 +60,15 @@ DELTA_STAGE1_SQL = (
 )
 
 
+# SQLite caps a compound SELECT at 500 UNION ALL terms by default
+# (SQLITE_MAX_COMPOUND_SELECT), and historically caps bound parameters at
+# 999 (SQLITE_MAX_VARIABLE_NUMBER). Stage 2 emits one UNION ALL branch per
+# channel, so a state with more than 500 active DeltaChannels exceeds the
+# compound limit. Keep each batch well under both limits.
+_DELTA_STAGE2_MAX_BRANCHES = 400
+_DELTA_STAGE2_MAX_PARAMS = 900
+
+
 def build_delta_stage2_sql(
     *, chain_lens: Sequence[int], has_task_path: bool = True
 ) -> str:
@@ -87,6 +96,62 @@ def build_delta_stage2_sql(
             f"AND checkpoint_id IN ({cid_placeholders})"
         )
     return " UNION ALL ".join(branches)
+
+
+def iter_delta_stage2_batches(
+    *,
+    channels: Sequence[str],
+    chain_by_ch: Mapping[str, list[str]],
+    thread_id: str,
+    checkpoint_ns: str,
+    has_task_path: bool = True,
+) -> Iterator[tuple[str, list[Any]]]:
+    """Yield `(sql, params)` pairs fetching stage-2 writes in batches.
+
+    Each batch covers a prefix of `channels` (in the caller's order) and
+    stays under SQLite's compound-SELECT term limit and bound-parameter
+    limit, so states with more than 500 active DeltaChannels no longer
+    fail with "too many terms in compound SELECT". Callers concatenate
+    the rows from every batch; `build_delta_channels_writes_history`
+    reorders them per channel, so batch boundaries do not affect order.
+    """
+    batch: list[str] = []
+    batch_params = 0
+    for ch in channels:
+        chain = chain_by_ch[ch]
+        # 3 fixed params per branch (thread_id, checkpoint_ns, channel)
+        # plus one per checkpoint id in the channel's chain.
+        branch_params = 3 + len(chain)
+        if batch and (
+            len(batch) >= _DELTA_STAGE2_MAX_BRANCHES
+            or batch_params + branch_params > _DELTA_STAGE2_MAX_PARAMS
+        ):
+            yield _stage2_batch(
+                batch, chain_by_ch, thread_id, checkpoint_ns, has_task_path
+            )
+            batch = []
+            batch_params = 0
+        batch.append(ch)
+        batch_params += branch_params
+    if batch:
+        yield _stage2_batch(batch, chain_by_ch, thread_id, checkpoint_ns, has_task_path)
+
+
+def _stage2_batch(
+    batch: Sequence[str],
+    chain_by_ch: Mapping[str, list[str]],
+    thread_id: str,
+    checkpoint_ns: str,
+    has_task_path: bool,
+) -> tuple[str, list[Any]]:
+    sql = build_delta_stage2_sql(
+        has_task_path=has_task_path,
+        chain_lens=[len(chain_by_ch[ch]) for ch in batch],
+    )
+    params: list[Any] = []
+    for ch in batch:
+        params.extend([thread_id, checkpoint_ns, ch, *chain_by_ch[ch]])
+    return sql, params
 
 
 def step_walk_with_row(

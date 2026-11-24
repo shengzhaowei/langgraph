@@ -269,3 +269,68 @@ async def test_seed_omitted_when_walk_reaches_root_async() -> None:
         entry = result["items"]
         assert "seed" not in entry, f"root-walk should have no seed, got {entry}"
         assert entry["writes"] == []
+
+
+# ---------------------------------------------------------------------------
+# More than 500 active DeltaChannels (see #9688)
+# ---------------------------------------------------------------------------
+
+
+def _total(previous: Any, writes: Any) -> Any:
+    return previous + sum(writes)
+
+
+def _wide_graph(checkpointer: Any, fields: dict[str, int]) -> Any:
+    WideState = TypedDict(
+        "WideState",
+        {key: Annotated[int, DeltaChannel(_total)] for key in fields},
+    )
+    return (
+        StateGraph(WideState)
+        .add_node("record", lambda state: fields)
+        .add_edge(START, "record")
+        .compile(checkpointer=checkpointer)
+    )
+
+
+def test_state_restores_with_more_than_500_delta_channels_sync() -> None:
+    """Stage 2 must not fail with 'too many terms in compound SELECT'
+    when a state has more than 500 active DeltaChannels (see #9688)."""
+    width = 501
+    fields = {f"counter_{i}": 1 for i in range(width)}
+    with SqliteSaver.from_conn_string(":memory:") as saver:
+        graph = _wide_graph(saver, fields)
+        config: RunnableConfig = {"configurable": {"thread_id": "wide-sync"}}
+        assert graph.invoke(fields, config) == dict.fromkeys(fields, 2)
+        assert graph.get_state(config).values == dict.fromkeys(fields, 2)
+
+        target = saver.get_tuple(config)
+        assert target is not None
+        history = saver.get_delta_channel_history(
+            config=target.config, channels=list(fields)
+        )
+        assert set(history) == set(fields)
+        for entry in history.values():
+            # Two writes per channel: the input write plus the node's write.
+            assert [value for _task_id, _channel, value in entry["writes"]] == [1, 1]
+
+
+async def test_state_restores_with_more_than_500_delta_channels_async() -> None:
+    """Async equivalent of the >500 DeltaChannels restore check."""
+    width = 501
+    fields = {f"counter_{i}": 1 for i in range(width)}
+    async with AsyncSqliteSaver.from_conn_string(":memory:") as saver:
+        graph = _wide_graph(saver, fields)
+        config: RunnableConfig = {"configurable": {"thread_id": "wide-async"}}
+        assert await graph.ainvoke(fields, config) == dict.fromkeys(fields, 2)
+        assert (await graph.aget_state(config)).values == dict.fromkeys(fields, 2)
+
+        target = await saver.aget_tuple(config)
+        assert target is not None
+        history = await saver.aget_delta_channel_history(
+            config=target.config, channels=list(fields)
+        )
+        assert set(history) == set(fields)
+        for entry in history.values():
+            # Two writes per channel: the input write plus the node's write.
+            assert [value for _task_id, _channel, value in entry["writes"]] == [1, 1]
