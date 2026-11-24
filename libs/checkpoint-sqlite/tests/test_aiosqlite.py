@@ -130,6 +130,34 @@ class TestAsyncSqliteSaver:
             assert len(search_results_7) == 1
             assert search_results_7[0].config["configurable"]["thread_id"] == "thread-1"
 
+    async def test_asearch_by_unsigned_64bit_metadata_id(self) -> None:
+        """Filtering by a metadata ID outside the signed 64-bit range must
+        match exactly, without raising OverflowError (see #9673)."""
+        record_ids = (2**63 - 1, 2**63, 2**63 + 1, 2**64 - 1)
+        async with AsyncSqliteSaver.from_conn_string(":memory:") as saver:
+            for i, record_id in enumerate(record_ids):
+                config: RunnableConfig = {
+                    "configurable": {
+                        "thread_id": f"thread-{i}",
+                        "checkpoint_ns": "",
+                    }
+                }
+                metadata: CheckpointMetadata = {
+                    "source": "input",
+                    "record_id": record_id,
+                }
+                await saver.aput(config, empty_checkpoint(), metadata, {})
+
+            for record_id in record_ids:
+                results = [
+                    c
+                    async for c in saver.alist(
+                        None, filter={"source": "input", "record_id": record_id}
+                    )
+                ]
+                assert len(results) == 1
+                assert results[0].metadata["record_id"] == record_id
+
     async def test_limit_parameter_sql_injection_prevention(self) -> None:
         """Test that the limit parameter properly uses parameterized queries to prevent SQL injection."""
         async with AsyncSqliteSaver.from_conn_string(":memory:") as saver:

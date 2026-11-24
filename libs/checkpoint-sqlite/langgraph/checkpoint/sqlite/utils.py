@@ -11,6 +11,11 @@ from langgraph.checkpoint.serde.base import SerializerProtocol
 
 _FILTER_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
+# SQLite INTEGER is a signed 64-bit integer. Values outside this range
+# cannot be bound as parameters.
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
+
 
 def _validate_filter_key(key: str) -> None:
     """Validate that a filter key is safe for use in SQL queries.
@@ -65,6 +70,21 @@ def _metadata_predicate(
     # process metadata query
     for query_key, query_value in metadata_filter.items():
         _validate_filter_key(query_key)
+        if (
+            isinstance(query_value, int)
+            and not isinstance(query_value, bool)
+            and not _SQLITE_INT_MIN <= query_value <= _SQLITE_INT_MAX
+        ):
+            # Integers outside SQLite's signed 64-bit range cannot be bound
+            # as parameters (OverflowError). Binding them as floats would
+            # lose precision, and json_extract() returns them as REAL, so
+            # adjacent IDs would collapse into the same double. Compare
+            # against the raw JSON text instead: `->` returns the number's
+            # original text, so every digit is preserved.
+            # NOTE: `->` requires SQLite >= 3.38.
+            predicates.append(f"CAST(metadata AS TEXT) -> '$.{query_key}' = ?")
+            param_values.append(json.dumps(query_value))
+            continue
         operator, param_value = _where_value(query_value)
         predicates.append(
             f"json_extract(CAST(metadata AS TEXT), '$.{query_key}') {operator}"

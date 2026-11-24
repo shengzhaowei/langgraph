@@ -1,3 +1,4 @@
+import json
 from typing import Any, cast
 
 import pytest
@@ -127,6 +128,42 @@ class TestSqliteSaver:
             )
             assert len(search_results_7) == 1
             assert search_results_7[0].config["configurable"]["thread_id"] == "thread-2"
+
+    def test_search_by_unsigned_64bit_metadata_id(self) -> None:
+        """Filtering by a metadata ID outside the signed 64-bit range must
+        match exactly, without raising OverflowError (see #9673)."""
+        record_ids = (2**63 - 1, 2**63, 2**63 + 1, 2**64 - 1)
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            for i, record_id in enumerate(record_ids):
+                config: RunnableConfig = {
+                    "configurable": {
+                        "thread_id": f"thread-{i}",
+                        "checkpoint_ns": "",
+                    }
+                }
+                metadata: CheckpointMetadata = {
+                    "source": "input",
+                    "record_id": record_id,
+                }
+                saver.put(config, empty_checkpoint(), metadata, {})
+
+            for record_id in record_ids:
+                results = list(
+                    saver.list(None, filter={"source": "input", "record_id": record_id})
+                )
+                assert len(results) == 1
+                assert results[0].metadata["record_id"] == record_id
+
+    def test_metadata_predicate_unsigned_64bit_id(self) -> None:
+        """Out-of-range integers use a raw JSON text comparison so adjacent
+        IDs stay distinct instead of collapsing into one float."""
+        predicates, param_values = _metadata_predicate({"record_id": 2**63})
+        assert predicates == ["CAST(metadata AS TEXT) -> '$.record_id' = ?"]
+        assert param_values == [json.dumps(2**63)]
+        # In-range integers keep the existing json_extract path.
+        predicates, param_values = _metadata_predicate({"record_id": 2**63 - 1})
+        assert predicates == ["json_extract(CAST(metadata AS TEXT), '$.record_id') = ?"]
+        assert param_values == [2**63 - 1]
 
     def test_search_where(self) -> None:
         # call method / assertions
